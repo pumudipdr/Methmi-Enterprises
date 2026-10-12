@@ -1,0 +1,14 @@
+node_modules
+
+frontend/.next
+.env.local
+backend/.env
+# Backend build files
+backend/dist/
+
+# Environment files containing secrets
+.env
+.env.*.local
+
+# Supabase CLI temporary files
+supabase/.temp/
