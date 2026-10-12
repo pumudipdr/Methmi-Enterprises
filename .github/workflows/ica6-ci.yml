@@ -1,0 +1,112 @@
+
+name: ICA6 CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-types:
+    name: Build and TypeScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+      # CI build values only. Deployment uses its hosting environment settings.
+      NEXT_PUBLIC_SITE_URL: https://example.invalid
+      BACKEND_URL: http://127.0.0.1:4000
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Next.js build generates the route types needed by a clean checkout.
+      - name: Build backend and frontend
+        run: npm run build
+
+      - name: Check TypeScript
+        run: npm run typecheck
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SUPABASE_TELEMETRY_DISABLED: "1"
+      TEST_DATABASE_CONFIRM: ISOLATED_TEST_DATABASE
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.120.0
+
+      # Start real Auth, Postgres and Storage in disposable runner containers.
+      - name: Prepare isolated Supabase database
+        run: |
+          mkdir -p "$RUNNER_TEMP/ica6-supabase"
+          supabase init --yes --workdir "$RUNNER_TEMP/ica6-supabase"
+          mkdir -p "$RUNNER_TEMP/ica6-supabase/supabase/migrations"
+          cp backend/schema.sql "$RUNNER_TEMP/ica6-supabase/supabase/migrations/20261011000000_test_schema.sql"
+          cat >> "$RUNNER_TEMP/ica6-supabase/supabase/migrations/20261011000000_test_schema.sql" <<'SQL'
+          insert into public.app_meta (key, value)
+          values ('ica5_test_database', 'TEST_ONLY')
+          on conflict (key) do update set value = excluded.value;
+          SQL
+          supabase start --workdir "$RUNNER_TEMP/ica6-supabase" --exclude studio,imgproxy,realtime,postgres-meta,edge-runtime,logflare,vector,supavisor
+          supabase status --workdir "$RUNNER_TEMP/ica6-supabase" --output json > "$RUNNER_TEMP/ica6-supabase-status.json"
+          node --input-type=module <<'JS'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const status = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/ica6-supabase-status.json`, 'utf8'));
+          const url = status.API_URL || status.PROJECT_URL;
+          const key = status.SERVICE_ROLE_KEY || status.SECRET_KEY;
+          if (!url || !key) throw new Error('Local Supabase did not return test credentials.');
+          console.log(`::add-mask::${key}`);
+          appendFileSync(process.env.GITHUB_ENV, `TEST_SUPABASE_URL=${url}\nTEST_SUPABASE_SERVICE_ROLE_KEY=${key}\n`);
+          JS
+
+      - name: Run unit and real database tests
+        run: npm run test:all
+
+      - name: Check test TypeScript
+        run: npm run test:types
+
+      - name: Stop isolated Supabase
+        if: always()
+        run: supabase stop --workdir "$RUNNER_TEMP/ica6-supabase" --no-backup
